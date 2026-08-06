@@ -11,14 +11,13 @@ st_autorefresh(interval=60000, key="datarefresh")
 st.set_page_config(layout="wide", page_title="Live Flight Anomaly Tracker")
 st.title("✈️ Live Aviation Radar & Anomaly Tracker")
 
-# 1. EXTRACT: Pull live states over the USA
-@st.cache_data(ttl=45) # Increased cache time to reduce API ban risk
+# 1. EXTRACT: Pull live states over India
+@st.cache_data(ttl=45) 
 def fetch_flight_data():
-    # Bounding box roughly covering the Continental US
-    url = "https://opensky-network.org/api/states/all?lamin=25&lomin=-125&lamax=50&lomax=-65"
+    # Bounding box covering India
+    url = "https://opensky-network.org/api/states/all?lamin=8&lomin=68&lamax=37&lomax=97"
     
     try:
-        # A 10-second timeout prevents the app from hanging infinitely
         res = requests.get(url, timeout=10)
         
         if res.status_code == 200:

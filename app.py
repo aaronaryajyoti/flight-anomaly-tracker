@@ -5,51 +5,62 @@ from sklearn.ensemble import IsolationForest
 from streamlit_autorefresh import st_autorefresh
 import psycopg2
 
-# Auto-refresh every 60 seconds
 st_autorefresh(interval=60000, key="datarefresh")
 
-st.set_page_config(layout="wide", page_title="Global Aviation & Weather Tracker")
+st.set_page_config(layout="wide", page_title="Global Aviation Tracker")
 st.title("🌍 Global Aviation Radar & Historical Trends")
 
-# --- UI TABS ---
 tab_live, tab_history = st.tabs(["📡 Live Global Radar", "📊 Historical Trends"])
 
-# --- SIDEBAR SETTINGS ---
+# --- API 1: Fetch All 216 Countries Dynamically ---
+@st.cache_data(ttl=86400)
+def get_country_list():
+    try:
+        res = requests.get("https://restcountries.com/v3.1/all", timeout=5)
+        countries = [c['name']['common'] for c in res.json()]
+        return sorted(countries)
+    except:
+        return ["India", "United States", "United Kingdom", "Australia"]
+
 st.sidebar.header("Dashboard Settings")
-region_choice = st.sidebar.selectbox(
-    "Select Airspace Region:",
-    ["Global (Entire World)", "India", "United States", "Europe", "Australia"]
-)
+region_choice = st.sidebar.selectbox("Select Airspace Region:", get_country_list())
 
-# OpenSky API boundaries
-bboxes = {
-    "Global (Entire World)": "",
-    "India": "lamin=8&lomin=68&lamax=37&lomax=97",
-    "United States": "lamin=25&lomin=-125&lamax=50&lomax=-65",
-    "Europe": "lamin=35&lomin=-15&lamax=70&lomax=40",
-    "Australia": "lamin=-44&lomin=113&lamax=-10&lomax=154"
-}
+# --- API 2: Calculate Bounding Box via Nominatim ---
+@st.cache_data
+def get_bounding_box(country_name):
+    headers = {"User-Agent": "StreamlitFlightTracker/1.0"}
+    url = f"https://nominatim.openstreetmap.org/search?country={country_name}&format=json"
+    try:
+        res = requests.get(url, headers=headers, timeout=5).json()
+        if res:
+            bbox = res[0]['boundingbox']
+            # Nominatim format: [south, north, west, east]
+            # AirLabs format: south,west,north,east
+            return f"{bbox[0]},{bbox[2]},{bbox[1]},{bbox[3]}"
+    except:
+        pass
+    return None
 
-# --- EXTRACT ---
+# --- API 3: Extract Flight Data via AirLabs ---
 @st.cache_data(ttl=45) 
-def fetch_flight_data(region_params):
-    base_url = "https://opensky-network.org/api/states/all"
-    url = f"{base_url}?{region_params}" if region_params else base_url
+def fetch_flight_data(bbox_str):
+    api_key = st.secrets.get("AIRLABS_API_KEY", None)
+    if not api_key or not bbox_str:
+        return []
+    
+    url = f"https://airlabs.co/api/v9/flights?api_key={api_key}&bbox={bbox_str}"
     try:
         res = requests.get(url, timeout=15)
         if res.status_code == 200:
-            data = res.json()
-            if data and 'states' in data and data['states'] is not None:
-                return data['states']
-            return []
+            return res.json().get('response', [])
         else:
-            st.error(f"OpenSky API Rate Limit Hit (Status Code: {res.status_code}).")
+            st.error(f"AirLabs API Error: {res.status_code}. Check your API Key.")
             return []
     except Exception as e:
-        st.error(f"Connection timeout: {e}")
+        st.error(f"Connection error: {e}")
         return []
 
-# --- ENRICH (WEATHER) ---
+# --- API 4: Enrich with Live Weather via Open-Meteo ---
 def get_flight_weather(lat, lon):
     url = f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&current=temperature_2m,wind_speed_10m,precipitation"
     try:
@@ -62,32 +73,19 @@ def get_flight_weather(lat, lon):
     return 0.0, 0.0, 0.0
 
 # --- TRANSFORM (ML & CLEANING) ---
-def process_data(states):
-    if not states:
+def process_data(flights):
+    if not flights:
         return pd.DataFrame()
         
-    cols = ['icao24', 'callsign', 'origin_country', 'time_position', 'last_contact', 
-            'lon', 'lat', 'baro_altitude', 'on_ground', 'velocity', 'true_track', 
-            'vertical_rate', 'sensors', 'geo_altitude', 'squawk', 'spi', 'position_source', 'category']
+    df = pd.DataFrame(flights)
     
-    df = pd.DataFrame(states, columns=cols[:len(states[0])])
-    
-    df = df[(df['on_ground'] == False) & 
-            df['baro_altitude'].notnull() & 
-            df['velocity'].notnull() & 
-            df['vertical_rate'].notnull()]
-    
-    df = df.dropna(subset=['lat', 'lon'])
-    
-    # Cap processing for global scope to prevent memory crashes on Streamlit Cloud
-    if len(df) > 5000:
-        df = df.sample(5000, random_state=42)
+    # Filter valid flights and map AirLabs columns to our standard format
+    df = df.dropna(subset=['lat', 'lng', 'alt', 'speed', 'v_speed'])
     
     if len(df) > 10:
-        features = df[['baro_altitude', 'velocity', 'vertical_rate']]
+        features = df[['alt', 'speed', 'v_speed']]
         
-        # 1% contamination ensures we only flag the most extreme outliers globally
-        model = IsolationForest(contamination=0.01, random_state=42)
+        model = IsolationForest(contamination=0.02, random_state=42)
         df['anomaly_score'] = model.fit_predict(features)
         
         df['status'] = df['anomaly_score'].apply(lambda x: '⚠️ Anomaly' if x == -1 else '✅ Normal')
@@ -96,7 +94,7 @@ def process_data(states):
         temps, winds, precips = [], [], []
         for _, row in df.iterrows():
             if row['status'] == '⚠️ Anomaly':
-                t, w, p = get_flight_weather(row['lat'], row['lon'])
+                t, w, p = get_flight_weather(row['lat'], row['lng'])
                 temps.append(t)
                 winds.append(w)
                 precips.append(p)
@@ -117,12 +115,9 @@ def process_data(states):
 
 # --- LOAD (DATABASE LOGGING) ---
 def log_anomalies_to_sql(anomalies_df, region):
-    if anomalies_df.empty:
-        return
-        
+    if anomalies_df.empty: return
     db_uri = st.secrets.get("DB_URI", None)
-    if not db_uri:
-        return
+    if not db_uri: return
 
     try:
         conn = psycopg2.connect(db_uri)
@@ -134,23 +129,25 @@ def log_anomalies_to_sql(anomalies_df, region):
         """
         
         for _, row in anomalies_df.iterrows():
-            callsign_clean = str(row.get('callsign', 'N/A')).strip()
-            if not callsign_clean: callsign_clean = "UNKNOWN"
-            reason = f"Zone: {region} | Temp: {row.get('temp_c')}°C | Wind: {row.get('wind_speed_kmh')}km/h"
+            callsign_clean = str(row.get('flight_icao', 'UNKNOWN')).strip()
+            
+            # Pack route and weather into the anomaly reason to avoid breaking the SQL table structure
+            route = f"{row.get('dep_iata', 'N/A')}->{row.get('arr_iata', 'N/A')}"
+            reason = f"Zone: {region} | Route: {route} | Temp: {row.get('temp_c')}C | Wind: {row.get('wind_speed_kmh')}km/h"
             
             cursor.execute(insert_query, (
                 callsign_clean,
-                float(row.get('baro_altitude', 0)),
-                float(row.get('velocity', 0)),
-                float(row.get('vertical_rate', 0)),
+                float(row.get('alt', 0)),
+                float(row.get('speed', 0)),
+                float(row.get('v_speed', 0)),
                 reason
             ))
             
         conn.commit()
         cursor.close()
         conn.close()
-    except:
-        pass
+    except Exception as e:
+        st.sidebar.error(f"SQL Error: {e}")
 
 # --- FETCH HISTORICAL DATA ---
 def fetch_historical_data():
@@ -160,11 +157,9 @@ def fetch_historical_data():
     try:
         conn = psycopg2.connect(db_uri)
         cursor = conn.cursor()
-        # Pull the 500 most recent anomalies from the database
         cursor.execute("SELECT timestamp, callsign, baro_altitude, velocity, vertical_rate, anomaly_reason FROM historical_anomalies ORDER BY timestamp DESC LIMIT 500")
         columns = [desc[0] for desc in cursor.description]
-        data = cursor.fetchall()
-        df = pd.DataFrame(data, columns=columns)
+        df = pd.DataFrame(cursor.fetchall(), columns=columns)
         cursor.close()
         conn.close()
         return df
@@ -175,40 +170,42 @@ def fetch_historical_data():
 # UI RENDERING
 # ==========================================
 
-# TAB 1: LIVE RADAR
 with tab_live:
-    with st.spinner(f'Fetching live radar data for {region_choice}...'):
-        raw_states = fetch_flight_data(bboxes[region_choice])
+    bbox_str = get_bounding_box(region_choice)
+    
+    with st.spinner(f'Analyzing airspace over {region_choice}...'):
+        raw_flights = fetch_flight_data(bbox_str)
         
-    df = process_data(raw_states)
+    df = process_data(raw_flights)
     
     if df.empty:
-        st.warning(f"No active flight data retrieved. The OpenSky API might be rate-limiting global pulls.")
+        st.warning(f"No active flight data retrieved for {region_choice}. There may be no commercial flights currently overhead, or the API is rate-limiting.")
     else:
         anomalies = df[df['status'] == '⚠️ Anomaly']
         log_anomalies_to_sql(anomalies, region_choice)
         
         col1, col2 = st.columns([2, 1])
         with col1:
-            st.subheader(f"Tracking Active Flights: {region_choice}")
-            # Zoom out further for global view
-            st.map(df, latitude='lat', longitude='lon', color='color', zoom=1 if region_choice == "Global (Entire World)" else 4)
+            st.subheader(f"Tracking {len(df)} Active Flights over {region_choice}")
+            st.map(df, latitude='lat', longitude='lng', color='color', zoom=3)
             
         with col2:
             st.subheader(f"Anomalies Detected: {len(anomalies)}")
             if not anomalies.empty:
-                # Individual expanding cards for each flight
                 for _, row in anomalies.iterrows():
-                    callsign = str(row['callsign']).strip() or "UNKNOWN"
-                    with st.expander(f"✈️ Flight {callsign} ({row['origin_country']})"):
-                        st.markdown(f"**GPS Coordinates:** {row['lat']:.4f}, {row['lon']:.4f}")
+                    callsign = str(row.get('flight_icao', 'UNKNOWN')).strip()
+                    with st.expander(f"✈️ Flight {callsign}"):
+                        
+                        # New Route Features from AirLabs
+                        st.markdown(f"**Route:** 🛫 {row.get('dep_iata', 'N/A')} ➡️ 🛬 {row.get('arr_iata', 'N/A')}")
+                        st.markdown(f"**GPS Coordinates:** {row['lat']:.4f}, {row['lng']:.4f}")
                         
                         st.write("---")
                         st.write("**📡 Telemetry (Anomaly Triggers)**")
                         m1, m2, m3 = st.columns(3)
-                        m1.metric("Altitude", f"{row['baro_altitude']} m")
-                        m2.metric("Velocity", f"{row['velocity']} m/s")
-                        m3.metric("Vert Rate", f"{row['vertical_rate']} m/s")
+                        m1.metric("Altitude", f"{row['alt']} m")
+                        m2.metric("Velocity", f"{row['speed']} km/h")
+                        m3.metric("Vert Rate", f"{row['v_speed']} m/s")
                         
                         st.write("---")
                         st.write("**⛅ Live Weather Encounters**")
@@ -219,18 +216,15 @@ with tab_live:
             else:
                 st.success("Airspace behavior is mathematically normal.")
 
-# TAB 2: HISTORICAL TRENDS
 with tab_history:
     st.subheader("Database Analytics & Trends")
     hist_df = fetch_historical_data()
     
     if not hist_df.empty:
-        # Chart 1: Altitude vs Velocity Scatter
         st.markdown("### 1. Velocity vs. Altitude of Past Anomalies")
         st.caption("Spotting erratic patterns: Look for data points showing exceptionally low altitude combined with high speed, or high altitude with low speed.")
         st.scatter_chart(hist_df, x='velocity', y='baro_altitude', color='#ff0000')
         
-        # Table: Raw Database Logs
         st.markdown("### 2. Raw Database Logs")
         st.dataframe(hist_df, use_container_width=True)
     else:

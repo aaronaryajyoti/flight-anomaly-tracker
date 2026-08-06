@@ -40,12 +40,14 @@ def process_data(states):
     if not states:
         return pd.DataFrame()
         
-    # OpenSky API returns arrays, these are the corresponding columns
+    # OpenSky API returns arrays, these are the maximum corresponding columns
     cols = ['icao24', 'callsign', 'origin_country', 'time_position', 'last_contact', 
             'lon', 'lat', 'baro_altitude', 'on_ground', 'velocity', 'true_track', 
             'vertical_rate', 'sensors', 'geo_altitude', 'squawk', 'spi', 'position_source', 'category']
     
-    df = pd.DataFrame(states, columns=cols)
+    # FIX: Dynamically slice the columns list to match the exact length of the incoming data
+    # If OpenSky sends 17 items, we only use the first 17 column names.
+    df = pd.DataFrame(states, columns=cols[:len(states[0])])
     
     # Clean: Filter for airborne planes with complete state vectors
     df = df[(df['on_ground'] == False) & 

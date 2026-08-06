@@ -1,5 +1,3 @@
-# flight-anomaly-tracker
-
 # Global Aviation Radar & Anomaly Tracker
 
 A real-time aviation tracking and anomaly detection dashboard built with Streamlit, Python, and Supabase PostgreSQL.

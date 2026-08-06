@@ -11,11 +11,25 @@ st_autorefresh(interval=60000, key="datarefresh")
 st.set_page_config(layout="wide", page_title="Live Flight Anomaly Tracker")
 st.title("✈️ Live Aviation Radar & Anomaly Tracker")
 
-# 1. EXTRACT: Pull live states over India
+# 1. User Input: Region Selection
+st.sidebar.header("Dashboard Settings")
+region_choice = st.sidebar.selectbox(
+    "Select Airspace Region:",
+    ["India", "United States", "Europe", "Australia"]
+)
+
+# Bounding boxes mapping for the API
+bboxes = {
+    "India": "lamin=8&lomin=68&lamax=37&lomax=97",
+    "United States": "lamin=25&lomin=-125&lamax=50&lomax=-65",
+    "Europe": "lamin=35&lomin=-15&lamax=70&lomax=40",
+    "Australia": "lamin=-44&lomin=113&lamax=-10&lomax=154"
+}
+
+# 2. EXTRACT: Pull live states for the selected region
 @st.cache_data(ttl=45) 
-def fetch_flight_data():
-    # Bounding box covering India
-    url = "https://opensky-network.org/api/states/all?lamin=8&lomin=68&lamax=37&lomax=97"
+def fetch_flight_data(region_params):
+    url = f"https://opensky-network.org/api/states/all?{region_params}"
     
     try:
         res = requests.get(url, timeout=10)
@@ -34,40 +48,31 @@ def fetch_flight_data():
         st.error(f"Connection timeout or error: {e}")
         return []
 
-# 2. TRANSFORM & ML: Format data and run anomaly detection
+# 3. TRANSFORM & ML: Format data and run anomaly detection
 def process_data(states):
     if not states:
         return pd.DataFrame()
         
-    # OpenSky API returns arrays, these are the maximum corresponding columns
     cols = ['icao24', 'callsign', 'origin_country', 'time_position', 'last_contact', 
             'lon', 'lat', 'baro_altitude', 'on_ground', 'velocity', 'true_track', 
             'vertical_rate', 'sensors', 'geo_altitude', 'squawk', 'spi', 'position_source', 'category']
     
-    # FIX: Dynamically slice the columns list to match the exact length of the incoming data
-    # If OpenSky sends 17 items, we only use the first 17 column names.
     df = pd.DataFrame(states, columns=cols[:len(states[0])])
     
-    # Clean: Filter for airborne planes with complete state vectors
     df = df[(df['on_ground'] == False) & 
             df['baro_altitude'].notnull() & 
             df['velocity'].notnull() & 
             df['vertical_rate'].notnull()]
     
-    # Drop planes with impossible coordinates
     df = df.dropna(subset=['lat', 'lon'])
     
     if len(df) > 10:
-        # ML Feature Selection: We want planes doing unusual physical maneuvers
         features = df[['baro_altitude', 'velocity', 'vertical_rate']]
         
-        # Train model to find the 2% most unusual flight patterns
         model = IsolationForest(contamination=0.02, random_state=42)
         df['anomaly_score'] = model.fit_predict(features)
         
-        # Format for dashboard
         df['status'] = df['anomaly_score'].apply(lambda x: '⚠️ Anomaly' if x == -1 else '✅ Normal')
-        # Red dots for anomalies, blue for normal
         df['color'] = df['status'].apply(lambda x: '#ff0000' if x == '⚠️ Anomaly' else '#0000ff')
     else:
         df['status'] = '✅ Normal'
@@ -75,22 +80,21 @@ def process_data(states):
         
     return df
 
-# Run Pipeline
-with st.spinner('Fetching live radar data from OpenSky...'):
-    raw_states = fetch_flight_data()
+# Run Pipeline based on the user's region choice
+with st.spinner(f'Fetching live radar data for {region_choice}...'):
+    raw_states = fetch_flight_data(bboxes[region_choice])
     
 df = process_data(raw_states)
 
 if df.empty:
-    st.warning("No data retrieved. OpenSky API might be rate-limiting you. The dashboard will automatically retry in 60 seconds.")
+    st.warning(f"No data retrieved for {region_choice}. The API might be rate-limiting or there are no active flights in this zone.")
     st.stop()
 
-# 3. LOAD & VISUALIZE
+# 4. LOAD & VISUALIZE
 col1, col2 = st.columns([2, 1])
 
 with col1:
-    st.subheader(f"Tracking {len(df)} Active Flights")
-    # Plot all flights on a map
+    st.subheader(f"Tracking {len(df)} Active Flights over {region_choice}")
     st.map(df, latitude='lat', longitude='lon', color='color', zoom=3)
 
 with col2:
@@ -98,7 +102,6 @@ with col2:
     st.subheader(f"Anomalies Detected: {len(anomalies)}")
     
     if not anomalies.empty:
-        # Format the anomalies table for readability
         display_cols = ['callsign', 'baro_altitude', 'velocity', 'vertical_rate']
         st.dataframe(anomalies[display_cols].reset_index(drop=True), use_container_width=True)
         st.caption("Look for extreme vertical rates (rapid climbs/dives) or unusually low speeds at high altitudes.")

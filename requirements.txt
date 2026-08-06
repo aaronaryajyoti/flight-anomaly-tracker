@@ -5,3 +5,4 @@ requests
 streamlit-autorefresh
 psycopg2-binary
 pycountry
+airportsdata
